@@ -20,9 +20,15 @@ package de.schildbach.wallet.offline;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.math.BigInteger;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 
+import org.bitcoin.protocols.payments.Protos;
+import org.bitcoin.protocols.payments.Protos.Payment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,8 +38,12 @@ import android.bluetooth.BluetoothSocket;
 import android.os.Handler;
 import android.os.Looper;
 
+import com.google.bitcoin.core.Address;
 import com.google.bitcoin.core.Transaction;
+import com.google.bitcoin.script.ScriptBuilder;
+import com.google.protobuf.ByteString;
 
+import de.schildbach.wallet.PaymentIntent;
 import de.schildbach.wallet.util.Bluetooth;
 
 /**
@@ -54,14 +64,15 @@ public abstract class SendBluetoothTask
 		this.callbackHandler = new Handler(Looper.myLooper());
 	}
 
-	public void send(@Nonnull final String bluetoothMac, @Nonnull final Transaction transaction)
+	public void send(@Nonnull final String bluetoothMac, @Nonnull final PaymentIntent.BIP bip, @Nonnull final Transaction transaction,
+			@Nonnull final Address refundAddress, @Nonnull final BigInteger refundAmount)
 	{
 		backgroundHandler.post(new Runnable()
 		{
 			@Override
 			public void run()
 			{
-				log.info("trying to send tx " + transaction.getHashAsString() + " via bluetooth");
+				log.info("trying to send tx {} via bluetooth {} using {} protocol", new Object[] { transaction.getHashAsString(), bluetoothMac, bip });
 
 				final byte[] serializedTx = transaction.unsafeBitcoinSerialize();
 
@@ -75,19 +86,40 @@ public abstract class SendBluetoothTask
 					socket = device.createInsecureRfcommSocketToServiceRecord(Bluetooth.BLUETOOTH_UUID);
 
 					socket.connect();
+					log.info("connected to {}", bluetoothMac);
+
 					is = new DataInputStream(socket.getInputStream());
 					os = new DataOutputStream(socket.getOutputStream());
 
-					os.writeInt(1);
-					os.writeInt(serializedTx.length);
-					os.write(serializedTx);
-					os.flush();
+					final boolean ack;
 
-					log.info("tx " + transaction.getHashAsString() + " sent via bluetooth");
+					if (bip.equals(PaymentIntent.BIP.BIP21))
+					{
+						os.writeInt(1);
+						os.writeInt(serializedTx.length);
+						os.write(serializedTx);
 
-					final boolean ack = is.readBoolean();
+						os.flush();
 
-					log.info("received " + (ack ? "ack" : "nack"));
+						log.info("tx {} sent via bluetooth using BIP21", transaction.getHashAsString());
+
+						ack = is.readBoolean();
+					}
+					else if (bip.equals(PaymentIntent.BIP.BIP70))
+					{
+						final Payment payment = writePaymentMessage(os, transaction, refundAddress, refundAmount, null);
+						os.flush();
+
+						log.info("tx {} sent via bluetooth using BIP70", transaction.getHashAsString());
+
+						ack = parsePaymentAck(is, payment);
+					}
+					else
+					{
+						throw new IllegalArgumentException("cannot handle: " + bip);
+					}
+
+					log.info("received {} via bluetooth", ack ? "ack" : "nack");
 
 					callbackHandler.post(new Runnable()
 					{
@@ -145,4 +177,37 @@ public abstract class SendBluetoothTask
 	}
 
 	protected abstract void onResult(boolean ack);
+
+	private static Payment writePaymentMessage(@Nonnull OutputStream os, @Nonnull final Transaction transaction,
+			@Nullable final Address refundAddress, @Nullable final BigInteger refundAmount, @Nullable final String memo) throws IOException
+	{
+		final Protos.Payment.Builder builder = Protos.Payment.newBuilder();
+
+		builder.addTransactions(ByteString.copyFrom(transaction.unsafeBitcoinSerialize()));
+
+		if (refundAddress != null)
+		{
+			if (refundAmount.compareTo(BigInteger.valueOf(Long.MAX_VALUE)) > 0)
+				throw new IllegalArgumentException("refund amount too big for protobuf: " + refundAmount);
+
+			final Protos.Output.Builder refundOutput = Protos.Output.newBuilder();
+			refundOutput.setAmount(refundAmount.longValue());
+			refundOutput.setScript(ByteString.copyFrom(ScriptBuilder.createOutputScript(refundAddress).getProgram()));
+			builder.addRefundTo(refundOutput);
+		}
+
+		if (memo != null)
+			builder.setMemo(memo);
+
+		final Payment payment = builder.build();
+		payment.writeDelimitedTo(os);
+		return payment;
+	}
+
+	private static boolean parsePaymentAck(@Nonnull final InputStream is, @Nonnull final Payment expectedPaymentMessage) throws IOException
+	{
+		final Protos.PaymentACK paymentAck = Protos.PaymentACK.parseDelimitedFrom(is);
+
+		return paymentAck.getPayment().equals(expectedPaymentMessage);
+	}
 }
